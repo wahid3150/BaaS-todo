@@ -8,16 +8,16 @@ const Login = () => {
   const location = useLocation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [successMessage, setSuccessMessage] = useState("");
+  const [successMessage, setSuccessMessage] = useState(
+    location.state?.message || "",
+  );
   const [formData, setFormData] = useState({
     email: "",
     password: "",
   });
 
   useEffect(() => {
-    // Display success message from register redirect
     if (location.state?.message) {
-      setSuccessMessage(location.state.message);
       // Clear message from history state
       window.history.replaceState({}, document.title);
     }
@@ -41,7 +41,7 @@ const Login = () => {
       // Delete any existing session first
       try {
         await appwriteAccount.deleteSession("current");
-      } catch (err) {
+      } catch {
         // No existing session, that's fine
         console.log("No existing session to delete");
       }

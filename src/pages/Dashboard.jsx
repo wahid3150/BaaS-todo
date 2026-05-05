@@ -1,8 +1,20 @@
-import { Plus, Trash2, CheckCircle2, LogOut, Loader } from "lucide-react";
-import { useState, useEffect } from "react";
+import {
+  CheckCircle2,
+  LogOut,
+  Loader,
+  Plus,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { appwriteAccount, appwriteDatabases } from "../appwrite/config";
-import { ID, Query } from "appwrite";
+import {
+  appwriteAccount,
+  appwriteDatabases,
+  appwriteStorage,
+} from "../appwrite/config";
+import { ID, Permission, Query, Role } from "appwrite";
 
 const Dashboard = () => {
   const navigate = useNavigate();
@@ -13,15 +25,32 @@ const Dashboard = () => {
   const [error, setError] = useState("");
   const [user, setUser] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [profilePhoto, setProfilePhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [userProfile, setUserProfile] = useState(null);
+  const didFetch = useRef(false);
 
   // Get the database and collection IDs from env
   const DB_ID = import.meta.env.VITE_APPWRITE_DB_ID;
   const COLLECTION_ID = import.meta.env.VITE_APPWRITE_TODOS_COLLECTION_ID;
+  const USERS_COLLECTION_ID = "users";
+  const BUCKET_ID = import.meta.env.VITE_APPWRITE_STORAGE_BUCKET_ID;
 
-  // Fetch user and todos on component mount
-  useEffect(() => {
-    fetchUserAndTodos();
-  }, []);
+  const getUserProfilePermissions = (userId) => [
+    Permission.read(Role.user(userId)),
+    Permission.update(Role.user(userId)),
+    Permission.delete(Role.user(userId)),
+  ];
+
+  const getProfilePhotoPermissions = (userId) => [
+    Permission.read(Role.any()),
+    Permission.update(Role.user(userId)),
+    Permission.delete(Role.user(userId)),
+  ];
+
+  const getProfilePhotoUrl = (fileId) =>
+    appwriteStorage.getFileView(BUCKET_ID, fileId);
 
   const fetchUserAndTodos = async () => {
     try {
@@ -32,6 +61,9 @@ const Dashboard = () => {
       const currentUser = await appwriteAccount.get();
       setUser(currentUser);
 
+      // Fetch user profile (with profile photo)
+      await fetchUserProfile(currentUser);
+
       // Fetch todos for this user
       await fetchTodos(currentUser.$id);
     } catch (err) {
@@ -41,6 +73,174 @@ const Dashboard = () => {
       navigate("/login");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchUserProfile = async (currentUser) => {
+    try {
+      // Check if user profile exists
+      const response = await appwriteDatabases.listDocuments(
+        DB_ID,
+        USERS_COLLECTION_ID,
+        [Query.equal("userId", currentUser.$id)],
+      );
+
+      if (response.documents.length > 0) {
+        const profile = response.documents[0];
+        setUserProfile(profile);
+
+        // If profile has a photo, get the direct view URL
+        if (profile.profilePhotoFileId) {
+          setProfilePhoto(getProfilePhotoUrl(profile.profilePhotoFileId));
+        }
+
+        return profile;
+      }
+
+      return await createDefaultUserProfile(currentUser);
+    } catch (err) {
+      console.error("Error fetching user profile:", err);
+      return await createDefaultUserProfile(currentUser);
+    }
+  };
+
+  const createDefaultUserProfile = async (currentUser) => {
+    try {
+      const newProfile = await appwriteDatabases.createDocument(
+        DB_ID,
+        USERS_COLLECTION_ID,
+        ID.unique(),
+        {
+          userId: currentUser.$id,
+          profilePhotoFileId: null,
+          displayName: currentUser.name || "User",
+        },
+        getUserProfilePermissions(currentUser.$id),
+      );
+      setUserProfile(newProfile);
+      return newProfile;
+    } catch (err) {
+      console.error("Error creating user profile:", err);
+      setError(
+        err.message ||
+          "Unable to create your profile. Check the users collection permissions.",
+      );
+      return null;
+    }
+  };
+
+  const handleProfilePhotoUpload = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+
+    if (!file) return;
+
+    if (!user) {
+      setError("You must be signed in before uploading a photo");
+      return;
+    }
+
+    // Validate file is an image
+    if (!file.type.startsWith("image/")) {
+      setError("Please upload an image file");
+      return;
+    }
+
+    // Validate file size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      setError("Image size must be less than 5MB");
+      return;
+    }
+
+    try {
+      setUploading(true);
+      setUploadProgress(0);
+      setError("");
+
+      const profile = userProfile || (await createDefaultUserProfile(user));
+
+      if (!profile) {
+        setError(
+          "Unable to prepare your profile. Check the users collection create/update permissions.",
+        );
+        return;
+      }
+
+      // Delete old photo if it exists
+      if (profile.profilePhotoFileId) {
+        try {
+          await appwriteStorage.deleteFile(
+            BUCKET_ID,
+            profile.profilePhotoFileId,
+          );
+        } catch (err) {
+          console.error("Error deleting old photo:", err);
+        }
+      }
+
+      // Upload new photo
+      const uploadedFile = await appwriteStorage.createFile(
+        BUCKET_ID,
+        ID.unique(),
+        file,
+        getProfilePhotoPermissions(user.$id),
+        (progress) => setUploadProgress(Math.round(progress.progress)),
+      );
+
+      // Update user profile with new file ID
+      const updatedProfile = await appwriteDatabases.updateDocument(
+        DB_ID,
+        USERS_COLLECTION_ID,
+        profile.$id,
+        {
+          profilePhotoFileId: uploadedFile.$id,
+        },
+      );
+
+      setUserProfile(updatedProfile);
+
+      setProfilePhoto(getProfilePhotoUrl(uploadedFile.$id));
+    } catch (err) {
+      console.error("Error uploading profile photo:", err);
+      setError(err.message || "Failed to upload profile photo");
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  const handleDeleteProfilePhoto = async () => {
+    if (!user || !userProfile || !userProfile.profilePhotoFileId) return;
+
+    try {
+      setUploading(true);
+      setUploadProgress(0);
+      setError("");
+
+      // Delete file from storage
+      await appwriteStorage.deleteFile(
+        BUCKET_ID,
+        userProfile.profilePhotoFileId,
+      );
+
+      // Update profile to remove file ID
+      const updatedProfile = await appwriteDatabases.updateDocument(
+        DB_ID,
+        USERS_COLLECTION_ID,
+        userProfile.$id,
+        {
+          profilePhotoFileId: null,
+        },
+      );
+
+      setUserProfile(updatedProfile);
+      setProfilePhoto(null);
+    } catch (err) {
+      console.error("Error deleting profile photo:", err);
+      setError(err.message || "Failed to delete profile photo");
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
     }
   };
 
@@ -143,6 +343,13 @@ const Dashboard = () => {
     }
   };
 
+  // Fetch user and todos on component mount
+  useEffect(() => {
+    if (didFetch.current) return;
+    didFetch.current = true;
+    fetchUserAndTodos();
+  }, []);
+
   const completedCount = todos.filter((t) => t.completed).length;
 
   if (loading) {
@@ -190,6 +397,79 @@ const Dashboard = () => {
             {error}
           </div>
         )}
+
+        {/* Profile Section */}
+        <div className="mb-8 rounded-lg bg-white p-6 shadow-md">
+          <h2 className="mb-4 text-lg font-semibold text-gray-900">Profile</h2>
+          <div className="flex items-center gap-6">
+            {/* Profile Photo */}
+            <div className="relative">
+              {profilePhoto ? (
+                <div className="relative h-24 w-24">
+                  <img
+                    src={profilePhoto}
+                    alt="Profile"
+                    onError={() => {
+                      setProfilePhoto(null);
+                      setError(
+                        "The photo uploaded, but Appwrite is blocking image preview. Allow public read on the storage bucket or enable file security with read permission.",
+                      );
+                    }}
+                    className="h-full w-full rounded-full border-4 border-blue-200 object-cover"
+                  />
+                  <button
+                    type="button"
+                    aria-label="Delete profile photo"
+                    onClick={handleDeleteProfilePhoto}
+                    disabled={uploading}
+                    className="absolute -right-1 -top-1 flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-red-500 text-white shadow-md transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              ) : (
+                <div className="h-24 w-24 rounded-full bg-gradient-to-br from-blue-200 to-indigo-200 flex items-center justify-center border-4 border-blue-100">
+                  <span className="text-2xl font-bold text-blue-600">
+                    {user?.name?.charAt(0)?.toUpperCase()}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Profile Info and Upload */}
+            <div className="flex-1">
+              <p className="mb-2 text-sm text-gray-600">Name</p>
+              <p className="mb-4 text-lg font-semibold text-gray-900">
+                {user?.name}
+              </p>
+              <p className="mb-2 text-sm text-gray-600">Email</p>
+              <p className="mb-4 text-gray-700">{user?.email}</p>
+
+              {/* Upload Button */}
+              <label
+                className={`inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition ${
+                  uploading
+                    ? "cursor-not-allowed opacity-50"
+                    : "cursor-pointer hover:bg-blue-700"
+                }`}
+              >
+                <Upload className="h-4 w-4" />
+                <span>
+                  {uploading
+                    ? `Uploading${uploadProgress ? ` ${uploadProgress}%` : "..."}`
+                    : "Upload Photo"}
+                </span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={handleProfilePhotoUpload}
+                  disabled={uploading}
+                  className="hidden"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
 
         {/* Stats */}
         <div className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-3">
